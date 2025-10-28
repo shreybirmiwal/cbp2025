@@ -2,12 +2,12 @@
 #define _PREDICTOR_H_
 #include <stdlib.h>
 
-class SampleCondPredictor
+class PreviousTakenPredictor
 {
     bool prevCorrectDecision = false;
     public:
 
-        SampleCondPredictor (void){}
+        PreviousTakenPredictor (void){}
         void setup(){}
         void terminate(){}
 
@@ -27,4 +27,5 @@ class SampleCondPredictor
 // =================
 
 #endif
-static SampleCondPredictor cond_predictor_impl;
+
+static PreviousTakenPredictor prev_taken_predictor;
