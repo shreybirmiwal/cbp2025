@@ -28,8 +28,9 @@ LIBS = -lcbp -lz
 FLAGS = -std=c++17 -L./lib $(LIBS) $(OPT)
 CPPFLAGS = -std=c++17 $(OPT)
 
-OBJ = cond_branch_predictor_interface.o my-predictors/prevTakenPredictor.o
-DEPS = cbp.h cond_branch_predictor_interface.h my-predictors/prevTakenPredictor.h
+OBJ = cond_branch_predictor_interface.o my-predictors/prevTakenPredictor.o my-predictors/perceptronPredictor.o my-predictors/bimodalPredictor.o
+DEPS = cbp.h cond_branch_predictor_interface.h my-predictors/prevTakenPredictor.h my-predictors/perceptronPredictor.h my-predictors/bimodalPredictor.h
+
 
 DEBUG=0
 ifeq ($(DEBUG), 1)

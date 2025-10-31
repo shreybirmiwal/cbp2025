@@ -228,3 +228,330 @@ Branch Misprediction PKI(BrMisPKI) AMean : 0.70365
 Cycles On Wrong-Path PKI(CycWpPKI) AMean : 47.6189
 -----------------------------------------------------------------------------------------------------------
 ```
+
+
+
+
+### Explaining the data we have from the interface
+
+# Branch Predictor API Guide
+
+This document explains all the features and data available for implementing branch predictors in this project.
+
+## Overview
+
+Your predictor is a **class** that implements these methods:
+- `setup()` - Called once at the start of simulation
+- `predict(seq_no, piece, PC)` - Make a prediction for a conditional branch
+- `history_update(seq_no, piece, PC, taken, nextPC)` - Update history after prediction (speculative)
+- `update(seq_no, piece, PC, resolveDir, predDir, nextPC)` - Update predictor when branch resolves
+- `terminate()` - Called once at the end of simulation
+
+---
+
+## 1. Pipeline Stage Callbacks
+
+The simulator calls your predictor at different pipeline stages. You can use information from ANY stage:
+
+### `beginCondDirPredictor()`
+- **When**: Once at simulation start
+- **Use**: Initialize your predictor data structures (tables, history, counters, etc.)
+- **Available**: Nothing specific - use for setup
+
+### `notify_instr_fetch(seq_no, piece, pc, fetch_cycle)`
+- **When**: Every instruction fetched (NOT just branches)
+- **Available Data**:
+  - `seq_no`: Unique sequential instruction number (increments for each instruction)
+  - `piece`: For SIMD instructions, some operations are split into pieces (usually 0)
+  - `pc`: Program counter (64-bit address) of the instruction
+  - `fetch_cycle`: Cycle number when instruction was fetched
+- **Use Cases**:
+  - Track instruction fetch patterns
+  - Build prefetch/history data
+  - See ALL instructions, not just branches
+
+### `get_cond_dir_prediction(seq_no, piece, pc, pred_cycle)` ⭐ MAIN PREDICTION
+- **When**: Only for conditional branches, right before execution
+- **Must Return**: `bool` - `true` = taken, `false` = not taken
+- **Available Data**:
+  - `seq_no`: Sequential instruction number
+  - `piece`: Usually 0
+  - `pc`: Program counter of the branch
+  - `pred_cycle`: Cycle when prediction is made
+- **What You Can Use**:
+  - PC (hash into tables)
+  - Global history (updated in `spec_update`)
+  - Local history (your own tables)
+  - Previous predictions/outcomes
+  - **Everything from `notify_instr_fetch`** (you can track state per PC)
+
+### `spec_update(seq_no, piece, pc, inst_class, resolve_dir, pred_dir, next_pc)`
+- **When**: Right after prediction, for ALL branches (conditional + unconditional)
+- **Timing**: Called SPECULATIVELY - outcome might be wrong!
+- **Available Data**:
+  - `inst_class`: Type of branch (see InstClass enum below)
+  - `resolve_dir`: Actual outcome (taken/not taken) - this is the CORRECT answer
+  - `pred_dir`: What you predicted (might be wrong!)
+  - `next_pc`: Target PC if taken
+- **Use Cases**:
+  - Update Global History Register (GHR) immediately
+  - Update speculative state
+  - Track branch types for different histories
+
+### `notify_instr_decode(seq_no, piece, pc, decode_info, decode_cycle)`
+- **When**: When instruction is decoded
+- **Available Data**:
+  - `decode_info`: Contains instruction class, register info (see DecodeInfo below)
+  - `decode_cycle`: Cycle when decoded
+- **Use Cases**:
+  - See register dependencies
+  - Identify instruction types early
+  - See source/destination registers
+
+### `notify_agen_complete(seq_no, piece, pc, decode_info, mem_va, mem_sz, agen_cycle)`
+- **When**: When load/store address generation completes
+- **Available Data**:
+  - `mem_va`: Virtual memory address (if load/store)
+  - `mem_sz`: Memory access size
+- **Use Cases**:
+  - Correlate memory access patterns with branches
+  - Use memory addresses as features
+
+### `notify_instr_execute_resolve(seq_no, piece, pc, pred_dir, exec_info, execute_cycle)` ⭐ MAIN UPDATE
+- **When**: When branch actually executes and resolves
+- **Timing**: This is when you know the TRUE outcome
+- **Available Data**:
+  - `pred_dir`: What you predicted earlier
+  - `exec_info`: Contains actual outcome and more (see ExecuteInfo below)
+- **Use Cases**:
+  - Update predictor tables with correct outcome
+  - Train perceptrons, update counters
+  - Learn from mistakes
+
+### `notify_instr_commit(seq_no, piece, pc, pred_dir, exec_info, commit_cycle)`
+- **When**: When instruction commits (retirement)
+- **Use Cases**:
+  - Final state updates
+  - Statistics collection
+  - Cleanup
+
+### `endCondDirPredictor()`
+- **When**: At end of simulation
+- **Use**: Print statistics, dump state, cleanup
+
+---
+
+## 2. Data Structures
+
+### InstClass (enum)
+Branch types you can distinguish:
+```cpp
+enum class InstClass {
+    condBranchInstClass = 3,           // Conditional branch (what you predict!)
+    uncondDirectBranchInstClass = 4,   // Unconditional direct branch
+    uncondIndirectBranchInstClass = 5, // Indirect branch (jump to register)
+    callDirectInstClass = 9,           // Direct function call
+    callIndirectInstClass = 10,        // Indirect function call
+    ReturnInstClass = 11,              // Return instruction
+    // ... other instruction types
+};
+```
+
+### DecodeInfo
+Available in `notify_instr_decode`:
+```cpp
+struct DecodeInfo {
+    InstClass insn_class;                    // Instruction type
+    std::vector<uint64_t> src_reg_info;     // Source register IDs
+    std::optional<uint64_t> dst_reg_info;   // Destination register ID (if any)
+};
+```
+
+### ExecuteInfo
+Available in `notify_instr_execute_resolve` and `notify_instr_commit`:
+```cpp
+struct ExecuteInfo {
+    DecodeInfo dec_info;                    // Decode info (see above)
+    std::optional<bool> taken;              // Actual taken/not-taken (for branches)
+    uint64_t next_pc;                       // Next PC (fall-through or target)
+    std::optional<uint64_t> taken_target;   // Target PC if taken
+    std::optional<uint64_t> mem_va;         // Memory address (if load/store)
+    std::optional<uint64_t> mem_sz;         // Memory size (if load/store)
+    std::optional<uint64_t> dst_reg_value;  // Register value written
+};
+```
+
+---
+
+## 3. Key Identifiers
+
+### `seq_no` (Sequence Number)
+- **Unique ID** for each instruction in program order
+- Increments for every instruction (even non-branches)
+- **Use**: Track instruction order, build history sequences
+- **Example**: Branch at seq_no=1000, next branch at seq_no=1045
+
+### `piece`
+- Usually 0 for normal instructions
+- For SIMD/vector instructions, operations split into pieces
+- **Use**: Usually ignore (always 0 for branches)
+
+### `pc` (Program Counter)
+- 64-bit instruction address
+- **Use**: 
+  - Hash into prediction tables
+  - Index pattern history tables
+  - Distinguish different branches
+  - Extract bits for hashing
+
+---
+
+## 4. What You Can Track/Store
+
+### ✅ Allowed:
+- **Prediction tables**: Arrays indexed by PC hash
+- **History registers**: Global/Local history (bits)
+- **Counters**: Saturated counters, perceptron weights
+- **PC-based structures**: Pattern history tables, target predictors
+- **Statistics**: Counters for accuracy, confidence
+- **State machines**: TAGE-style state machines
+
+### ❌ Not Available:
+- Can't modify simulator state
+- Can't see future instructions (only past via history)
+- Can't directly access memory/cache (but can see addresses in callbacks)
+
+---
+
+## 5. Common Predictor Patterns
+
+### Simple Bimodal Predictor
+```cpp
+bool predict(uint64_t seq_no, uint8_t piece, uint64_t PC) {
+    uint32_t index = PC % TABLE_SIZE;
+    return counters[index] >= 2;  // Threshold
+}
+
+void update(...) {
+    if (resolveDir == predDir) {
+        counters[index] = saturate_increment(counters[index]);
+    } else {
+        counters[index] = saturate_decrement(counters[index]);
+    }
+}
+```
+
+### Global History Predictor (GShare)
+```cpp
+uint64_t global_history = 0;  // Track in your class
+
+bool predict(uint64_t seq_no, uint8_t piece, uint64_t PC) {
+    uint32_t index = (PC ^ global_history) % TABLE_SIZE;
+    return counters[index] >= 2;
+}
+
+void history_update(...) {
+    global_history = (global_history << 1) | (taken ? 1 : 0);
+    global_history &= HISTORY_MASK;  // Keep fixed width
+}
+```
+
+### Perceptron Predictor
+```cpp
+int weights[N][HISTORY_LENGTH];
+
+bool predict(uint64_t seq_no, uint8_t piece, uint64_t PC) {
+    int sum = weights[PC % N][0];  // Bias
+    for (int i = 0; i < HISTORY_LENGTH; i++) {
+        if (global_history & (1 << i)) {
+            sum += weights[PC % N][i+1];
+        } else {
+            sum -= weights[PC % N][i+1];
+        }
+    }
+    return sum >= 0;
+}
+```
+
+---
+
+## 6. Timing Notes
+
+**Important**: The simulator runs out-of-order, so:
+- `spec_update` happens **immediately** after prediction (speculative)
+- `notify_instr_execute_resolve` happens **later** when branch executes
+- Instructions can execute out of order!
+- Use `seq_no` to track program order if needed
+
+**Example Timeline**:
+1. Instruction at seq_no=100 predicted → `get_cond_dir_prediction` called
+2. `spec_update` called immediately (speculative history update)
+3. Many more instructions fetched/predicted...
+4. Eventually, seq_no=100 executes → `notify_instr_execute_resolve` called
+5. Update predictor with true outcome
+
+---
+
+## 7. Example: What Data is Available When?
+
+### Predicting a Branch:
+```
+You have:
+- PC (64-bit address)
+- seq_no (instruction order)
+- Your internal state (history, tables)
+- Previous branch outcomes (via your history)
+```
+
+### Updating After Prediction:
+```
+You get:
+- resolve_dir (correct answer!)
+- pred_dir (what you predicted)
+- next_pc (target address)
+- You can update speculative history
+```
+
+### When Branch Executes:
+```
+You get:
+- ExecuteInfo with full details
+- Actual taken/not-taken
+- Memory addresses (if load/store before this branch)
+- Register values
+- You can update tables with true outcome
+```
+
+---
+
+## 8. Tips for Implementation
+
+1. **Use PC bits**: Hash PC to index tables: `index = (PC >> 2) & MASK`
+2. **Track history**: Global/Local history are powerful features
+3. **Combine predictors**: Can use multiple simple predictors together
+4. **Watch timing**: Update history speculatively, update tables on resolve
+5. **Use seq_no**: Track program order if needed for correct updates
+6. **Memory budget**: You have up to 128KB additional (on top of TAGE-SC-L's 64KB)
+
+---
+
+## Summary Checklist
+
+What you CAN use:
+- ✅ PC (program counter) - hash/index into tables
+- ✅ seq_no - instruction order
+- ✅ Global/Local history (build yourself)
+- ✅ Previous predictions/outcomes
+- ✅ Instruction types (conditional, indirect, etc.)
+- ✅ Register information (from decode)
+- ✅ Memory addresses (from agen)
+- ✅ Cycle timestamps
+- ✅ Any internal state you maintain
+
+What you CANNOT use:
+- ❌ Future instructions (only past via history)
+- ❌ Direct memory access
+- ❌ Other predictors' internal state (except TAGE-SC-L via provided interface)
+
+**Your predictor is a class - you can store ANY state you want as member variables!**
+

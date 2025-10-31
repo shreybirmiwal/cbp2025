@@ -1,14 +1,14 @@
-#ifndef _PREV_TAKEN_PREDICTOR_H_
-#define _PREV_TAKEN_PREDICTOR_H_
+#ifndef _PERCEPTRON_PREDICTOR_H_
+#define _PERCEPTRON_PREDICTOR_H_
 #include <stdlib.h>
 #include <stdint.h>
 
-class PreviousTakenPredictor
+class PerceptronPredictor
 {
     bool prevCorrectDecision = false;
     public:
 
-        PreviousTakenPredictor (void){}
+        PerceptronPredictor (void){}
         void setup(){}
         void terminate(){}
 
@@ -27,6 +27,6 @@ class PreviousTakenPredictor
 // Predictor End
 // =================
 
-static PreviousTakenPredictor prev_taken_predictor;
+static PerceptronPredictor perceptron_predictor;
 
 #endif
